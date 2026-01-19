@@ -1,22 +1,54 @@
-# Fincode Payment Integration - Complete Technical Documentation
+# Fincode Payment - Technical Documentation
 
 **Last Updated**: 2026-01-19  
-**Architecture**: Clean Service Layer with Gateway Pattern  
-**Payment Provider**: Fincode (Japan)
+**Payment Provider**: Fincode
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Payment Operations](#payment-operations)
-4. [Payment State Machine](#payment-state-machine)
+1. [Quick Start](#quick-start)
+2. [Overview](#overview)
+3. [Payment Flow](#payment-flow)
+4. [Implementation Guide](#implementation-guide)
 5. [API Reference](#api-reference)
-6. [Implementation Guide](#implementation-guide)
-7. [Error Handling](#error-handling)
-8. [Testing](#testing)
-9. [Security](#security)
+6. [Testing](#testing)
+7. [Production Deployment](#production-deployment)
+8. [Fincode Reference](#fincode-reference)
+
+---
+
+## Quick Start
+
+### Environment Setup
+
+```bash
+# Development
+FINCODE_API_URL=https://api.test.fincode.jp
+FINCODE_SECRET_KEY=sk_test_...
+FINCODE_PUBLIC_KEY=pk_test_...
+
+# Production
+FINCODE_API_URL=https://api.fincode.jp
+FINCODE_SECRET_KEY=sk_live_...
+FINCODE_PUBLIC_KEY=pk_live_...
+```
+
+### Test Card
+
+```
+Card Number: 4111111111111111
+Expiry: 2512 (YYMM)
+CVV: 123
+Holder: TARO YAMADA
+```
+
+### Basic Flow
+
+1. **Register Payment** → Backend creates payment session
+2. **Tokenize Card** → Frontend converts card to token (PCI safe)
+3. **Execute Payment** → Frontend authorizes with token
+4. **Capture Payment** → Backend charges the card
 
 ---
 
@@ -24,15 +56,15 @@
 
 ### Design Goals
 
-- **Streamlined Purchase**: Direct purchases from product detail pages
-- **Security First**: PCI DSS compliance through client-side tokenization
-- **Flexible Cancellation**: Support cancellation before capture
-- **Full Refund Support**: Both full and partial refunds for captured payments
-- **Multi-Gateway Ready**: Abstracted gateway interface for future payment providers
+- ✅ **Streamlined Purchase**: Direct purchases from product detail pages
+- ✅ **Security First**: PCI DSS compliance through client-side tokenization
+- ✅ **Flexible Operations**: Support for capture, cancel, and refund
+- ✅ **Multi-Gateway Ready**: Abstracted gateway interface for future providers
+- ✅ **Clean Architecture**: Service Layer with Strategy Pattern
 
-### Two-Phase Payment Model
+### Payment Model
 
-Fincode implements a **authorize-then-capture** model with frontend tokenization:
+Fincode uses an **authorize-then-capture** model:
 
 ```
 ┌──────────────┐      ┌─────────────┐      ┌─────────────┐      ┌──────────────┐
@@ -52,22 +84,19 @@ Fincode implements a **authorize-then-capture** model with frontend tokenization
                                             └─────────────┘      └──────────────┘
 ```
 
-**Key Steps**:
+**Key Operations**:
 1. **Register** (Backend): Create payment session on Fincode
-2. **Tokenize** (Frontend): Convert card details to secure token (Fincode SDK)
-3. **Execute** (Frontend): Authorize payment with token - funds reserved but not charged
-4. **Capture** (Backend): Actually charge the card and complete purchase
-5. **Cancel** (Backend): Release authorization before capture (optional)
-6. **Refund** (Backend): Return funds after capture (optional)
-
+2. **Tokenize** (Frontend): Convert card details to secure token
+3. **Execute** (Frontend): Authorize payment - funds reserved but not charged
+4. **Capture** (Backend): Actually charge the card
+5. **Cancel** (Backend): Release authorization before capture
+6. **Refund** (Backend): Return funds after capture
 
 ---
 
-## Architecture
+## Payment Flow
 
 ### End-to-End Payment Flow
-
-The following diagram shows the complete payment flow from user interaction to order completion:
 
 ```mermaid
 sequenceDiagram
@@ -108,7 +137,7 @@ sequenceDiagram
     FE-->>User: Show Order Confirmation
 ```
 
-### Refund Flow (Post-Purchase)
+### Refund Flow
 
 ```mermaid
 sequenceDiagram
@@ -128,9 +157,45 @@ sequenceDiagram
     Note over Customer: Funds returned to card (3-5 days)
 ```
 
+### Payment State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: Register Payment
+    PENDING --> AUTHORIZED: Execute Payment (Frontend)
+    PENDING --> FAILED: Authorization Failed
+    
+    AUTHORIZED --> CAPTURED: Capture Payment
+    AUTHORIZED --> CANCELLED: Cancel Payment
+    AUTHORIZED --> FAILED: Capture Failed
+    
+    CAPTURED --> PARTIALLY_REFUNDED: Partial Refund
+    CAPTURED --> REFUNDED: Full Refund
+    PARTIALLY_REFUNDED --> REFUNDED: Refund Remaining Amount
+    
+    FAILED --> [*]
+    CANCELLED --> [*]
+    REFUNDED --> [*]
+    CAPTURED --> [*]: Complete
+```
+
+**State Descriptions**:
+
+| State | Description | Available Actions |
+|-------|-------------|-------------------|
+| `PENDING` | Payment registered, awaiting authorization | Execute, Expire |
+| `AUTHORIZED` | Funds reserved on card | Capture, Cancel |
+| `CAPTURED` | Payment complete, funds charged | Refund |
+| `CANCELLED` | Authorization cancelled | None (terminal) |
+| `FAILED` | Payment failed | None (terminal) |
+| `PARTIALLY_REFUNDED` | Some funds returned | Refund (remaining) |
+| `REFUNDED` | Fully refunded | None (terminal) |
+
 ---
 
-### Clean Architecture Layers
+## Implementation Guide
+
+### Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -166,7 +231,8 @@ sequenceDiagram
 
 ### Key Components
 
-#### 1. **PaymentService** (Service Layer)
+#### 1. PaymentService (Service Layer)
+
 ```ruby
 module Payments
   class PaymentService
@@ -178,25 +244,52 @@ module Payments
     end
 
     def register_payment(amount:)
-      # Business logic here
+      validate_amount!(amount)
+      
+      result = gateway.register(amount: amount, user: current_user)
+      
+      payment = Payment.create!(
+        user: current_user,
+        fincode_order_id: result[:id],
+        fincode_access_id: result[:access_id],
+        amount: amount,
+        status: :authorized
+      )
+
+      {
+        order_id: payment.fincode_order_id,
+        access_id: payment.fincode_access_id,
+        amount: payment.amount,
+        public_key: ENV.fetch('FINCODE_PUBLIC_KEY')
+      }
     end
 
     def capture_payment(payment_id:)
-      # Business logic here
+      payment = find_payment!(payment_id)
+      validate_can_capture!(payment)
+
+      gateway.capture(
+        order_id: payment.fincode_order_id,
+        access_id: payment.fincode_access_id,
+        amount: payment.amount
+      )
+
+      payment.update!(status: :captured, captured_at: Time.current)
+
+      {
+        payment_id: payment.id,
+        status: payment.status,
+        amount: payment.amount
+      }
     end
-    
+
     # ... other methods
   end
 end
 ```
 
-**Responsibilities**:
-- Orchestrate business logic
-- Validate business rules
-- Manage database transactions
-- Call gateway for external API operations
+#### 2. Gateway Interface
 
-#### 2. **BaseGateway** (Gateway Interface)
 ```ruby
 module Payments
   module Gateways
@@ -221,11 +314,8 @@ module Payments
 end
 ```
 
-**Responsibilities**:
-- Define payment gateway contract
-- Enable multi-gateway support (Strategy Pattern)
+#### 3. FincodeGateway Implementation
 
-#### 3. **FincodeGateway** (Concrete Gateway)
 ```ruby
 module Payments
   module Gateways
@@ -262,68 +352,18 @@ module Payments
       rescue FincodeClient::FincodeError => e
         raise Payments::Error, e.message
       end
-    end
-  end
-end
-```
 
-**Responsibilities**:
-- Adapt Fincode API to gateway interface
-- Transform data formats
-- Handle Fincode-specific errors
-
-#### 4. **FincodeClient** (HTTP Client)
-```ruby
-module Payments
-  module Gateways
-    class FincodeClient
-      include HTTParty
-      base_uri ENV['FINCODE_API_URL']
-      
-      class FincodeError < StandardError; end
-
-      def register(order_id:, amount:, customer_info: {})
-        response = self.class.post(
-          '/v1/payments',
-          headers: headers,
-          body: {
-            pay_type: 'Card',
-            job_code: 'AUTH',
-            amount: amount.to_s,
-            tax: '0',
-            id: order_id,
-            client_field_1: customer_info[:email],
-            client_field_2: customer_info[:name]
-          }.to_json
-        )
-
-        handle_response(response)
-      end
-
-      private
-
-      def handle_response(response)
-        case response.code
-        when 200, 201
-          response.parsed_response
-        when 400
-          raise FincodeError, "Bad Request"
-        when 401
-          raise FincodeError, "Unauthorized"
-        # ... other error codes
-        end
+      def generate_order_id
+        "ORD_#{Time.current.to_i}_#{SecureRandom.hex(6)}"
       end
     end
   end
 end
 ```
 
-**Responsibilities**:
-- Make HTTP requests to Fincode API
-- Parse responses
-- Raise appropriate errors
+### Error Handling
 
-### Error Handling Strategy
+#### Centralized Error Handling
 
 ```ruby
 # app/services/payments.rb
@@ -355,443 +395,35 @@ class ApplicationController < ActionController::API
 end
 ```
 
-**Benefits**:
-- Centralized error handling
-- Consistent error responses
-- Clean controller code (no rescue blocks)
+### Database Schema
 
----
-
-## Payment Operations
-
-### 1. Register Payment
-
-**Purpose**: Initialize payment session on Fincode
-
-**When**: User confirms intent to purchase from product detail page
-
-**Backend Endpoint**: `POST /api/v1/payments/register`
-
-**Request**:
-```json
-{
-  "amount": 5000
-}
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "order_id": "ORD_1737273600_a1b2c3d4e5f6",
-  "access_id": "a_9876543210fedcba",
-  "amount": 5000,
-  "public_key": "pk_test_..."
-}
-```
-
-**Implementation**:
 ```ruby
-def register_payment(amount:)
-  validate_amount!(amount)
-  
-  public_key = ENV.fetch('FINCODE_PUBLIC_KEY')
-  
-  result = gateway.register(
-    amount: amount,
-    user: current_user
-  )
-
-  payment = Payment.create!(
-    user: current_user,
-    fincode_order_id: result[:id],
-    fincode_access_id: result[:access_id],
-    amount: amount,
-    status: :authorized,
-    authorized_at: Time.current,
-    customer_email: current_user.email
-  )
-
-  {
-    order_id: payment.fincode_order_id,
-    access_id: payment.fincode_access_id,
-    amount: payment.amount,
-    public_key: public_key
-  }
+# Payments Table
+create_table :payments do |t|
+  t.references :user, foreign_key: true
+  t.string :fincode_order_id, null: false, index: { unique: true }
+  t.string :fincode_access_id, null: false
+  t.integer :amount, null: false
+  t.string :status, default: 'pending', null: false
+  t.string :customer_email
+  t.datetime :authorized_at
+  t.datetime :captured_at
+  t.datetime :canceled_at
+  t.timestamps
 end
 
-private
-
-def validate_amount!(amount)
-  raise Payments::ValidationError, 'Invalid amount' if amount.nil? || amount < 100
+# Refunds Table
+create_table :refunds do |t|
+  t.references :payment, null: false, foreign_key: true
+  t.references :processed_by, foreign_key: { to_table: :users }
+  t.integer :amount, null: false
+  t.text :reason
+  t.string :status, default: 'pending', null: false
+  t.string :fincode_refund_id
+  t.datetime :processed_at
+  t.timestamps
 end
 ```
-
-**Fincode API Call**:
-```http
-POST /v1/payments
-Content-Type: application/json
-Authorization: Bearer {SECRET_KEY}
-
-{
-  "pay_type": "Card",
-  "job_code": "AUTH",
-  "amount": "5000",
-  "tax": "0",
-  "id": "ORD_1737273600_a1b2c3d4e5f6",
-  "client_field_1": "user@example.com",
-  "client_field_2": "John Doe"
-}
-```
-
----
-
-### 2. Execute Payment (Authorization)
-
-**Purpose**: Tokenize card and authorize payment
-
-**When**: User submits card details on payment form
-
-**Process**: **Entirely on frontend** using Fincode SDK
-
-**Frontend Implementation**:
-```javascript
-// Initialize Fincode SDK
-const fincodeInstance = Fincode(publicKey);
-
-// Step 1: Tokenize Card
-fincodeInstance.tokens(
-  {
-    card_no: '4111111111111111',
-    expire: '2512',  // YYMM format
-    holder_name: 'TARO YAMADA',
-    security_code: '123'
-  },
-  function(status, response) {
-    if (status === 200 || status === 201) {
-      const token = response.id;
-      authorizePayment(token);
-    } else {
-      handleError(response.errors);
-    }
-  }
-);
-
-// Step 2: Execute Payment (Authorize)
-function authorizePayment(token) {
-  fincodeInstance.payments(
-    {
-      id: orderId,              // From register response
-      pay_type: 'Card',
-      access_id: accessId,      // From register response
-      token: token,
-      method: '1',              // 1: Lump sum payment
-      card_no: cardNumber,
-      expire: expireDate,
-      holder_name: holderName,
-      security_code: cvv
-    },
-    function(status, response) {
-      if (status === 200) {
-        // Payment authorized - show confirmation screen
-        showConfirmationScreen(response);
-      } else {
-        handleError(response.errors);
-      }
-    }
-  );
-}
-```
-
-**After Success**: Payment status becomes `AUTHORIZED` - funds are reserved but not yet charged
-
----
-
-### 3. Confirm Payment
-
-**Purpose**: Sync payment status after frontend authorization
-
-**Backend Endpoint**: `POST /api/v1/payments/:id/confirm`
-
-**Response**:
-```json
-{
-  "success": true,
-  "payment_id": 123,
-  "status": "authorized",
-  "authorized_at": "2026-01-19T09:00:00Z",
-  "amount": 5000
-}
-```
-
-**Implementation**:
-```ruby
-def confirm_payment(payment_id:)
-  payment = find_payment!(payment_id)
-
-  {
-    payment_id: payment.id,
-    status: payment.status,
-    authorized_at: payment.authorized_at,
-    amount: payment.amount
-  }
-end
-```
-
----
-
-### 4. Capture Payment
-
-**Purpose**: Actually charge the customer's card
-
-**Backend Endpoint**: `POST /api/v1/payments/:id/capture`
-
-**Response**:
-```json
-{
-  "success": true,
-  "payment_id": 123,
-  "status": "captured",
-  "captured_at": "2026-01-19T09:05:00Z",
-  "amount": 5000,
-  "message": "Payment captured successfully"
-}
-```
-
-**Implementation**:
-```ruby
-def capture_payment(payment_id:)
-  payment = find_payment!(payment_id)
-  
-  validate_can_capture!(payment)
-
-  gateway.capture(
-    order_id: payment.fincode_order_id,
-    access_id: payment.fincode_access_id,
-    amount: payment.amount
-  )
-
-  payment.update!(
-    status: :captured,
-    captured_at: Time.current
-  )
-
-  {
-    payment_id: payment.id,
-    status: payment.status,
-    captured_at: payment.captured_at,
-    amount: payment.amount
-  }
-end
-
-private
-
-def validate_can_capture!(payment)
-  return if payment.status == 'authorized'
-  
-  raise Payments::ValidationError, 'Payment must be authorized to capture'
-end
-```
-
----
-
-### 5. Cancel Payment
-
-**Purpose**: Cancel an authorized payment before capture
-
-**Backend Endpoint**: `POST /api/v1/payments/:id/cancel`
-
-**Restrictions**:
-- Only `AUTHORIZED` payments can be cancelled
-- Cannot cancel after capture (use refund instead)
-
-**Response**:
-```json
-{
-  "success": true,
-  "payment_id": 123,
-  "status": "cancelled",
-  "canceled_at": "2026-01-19T09:03:00Z",
-  "amount": 5000,
-  "message": "Payment cancelled successfully"
-}
-```
-
-**Implementation**:
-```ruby
-def cancel_payment(payment_id:)
-  payment = find_payment!(payment_id)
-  
-  validate_can_cancel!(payment)
-
-  gateway.cancel(
-    order_id: payment.fincode_order_id,
-    access_id: payment.fincode_access_id
-  )
-
-  payment.update!(
-    status: :cancelled,
-    canceled_at: Time.current
-  )
-
-  {
-    payment_id: payment.id,
-    status: payment.status,
-    canceled_at: payment.canceled_at,
-    amount: payment.amount
-  }
-end
-
-private
-
-def validate_can_cancel!(payment)
-  return if payment.can_cancel?
-  
-  raise Payments::ValidationError, 'Payment cannot be cancelled'
-end
-```
-
----
-
-### 6. Refund Payment
-
-**Purpose**: Return funds to customer after capture
-
-**Backend Endpoint**: `POST /api/v1/payments/:id/refund`
-
-**Types**:
-- **Full Refund**: Entire payment amount
-- **Partial Refund**: Portion of payment amount
-
-**Request**:
-```json
-{
-  "amount": 2000,  // Optional: omit for full refund
-  "reason": "Customer requested refund"
-}
-```
-
-**Response**:
-```json
-{
-  "success": true,
-  "refund_id": 456,
-  "payment_id": 123,
-  "amount": 2000,
-  "status": "completed",
-  "remaining_amount": 3000,
-  "message": "Refund processed successfully"
-}
-```
-
-**Implementation**:
-```ruby
-def refund_payment(payment_id:, amount: nil, reason: nil)
-  payment = find_payment!(payment_id)
-  
-  validate_can_refund!(payment)
-
-  refund_amount = amount || payment.amount
-  validate_refund_amount!(payment, refund_amount)
-
-  result = gateway.refund(
-    order_id: payment.fincode_order_id,
-    access_id: payment.fincode_access_id,
-    amount: refund_amount
-  )
-
-  refund = Refund.create!(
-    payment: payment,
-    amount: refund_amount,
-    reason: reason,
-    status: :completed,
-    processed_by: current_user,
-    processed_at: Time.current,
-    fincode_refund_id: result[:id]
-  )
-
-  update_payment_refund_status!(payment, refund_amount)
-
-  {
-    refund_id: refund.id,
-    payment_id: payment.id,
-    amount: refund_amount,
-    status: refund.status,
-    remaining_amount: payment.refundable_amount
-  }
-end
-
-private
-
-def validate_can_refund!(payment)
-  return if payment.can_refund?
-  
-  raise Payments::ValidationError, 'Only captured payments can be refunded'
-end
-
-def validate_refund_amount!(payment, refund_amount)
-  remaining = payment.refundable_amount
-
-  if refund_amount > remaining
-    raise Payments::ValidationError, "Refund amount exceeds remaining amount (¥#{remaining})"
-  end
-
-  raise Payments::ValidationError, 'Refund amount must be greater than 0' if refund_amount <= 0
-end
-
-def update_payment_refund_status!(payment, refund_amount)
-  new_status = if fully_refunded?(payment, refund_amount)
-                 :refunded
-               else
-                 :partially_refunded
-               end
-
-  payment.update!(status: new_status)
-end
-
-def fully_refunded?(payment, refund_amount)
-  total_refunded = payment.total_refunded + refund_amount
-  total_refunded >= payment.amount
-end
-```
-
----
-
-## Payment State Machine
-
-### State Transition Diagram
-
-```mermaid
-stateDiagram-v2
-    [*] --> PENDING: Register Payment
-    PENDING --> AUTHORIZED: Execute Payment (Frontend)
-    PENDING --> FAILED: Authorization Failed
-    
-    AUTHORIZED --> CAPTURED: Capture Payment
-    AUTHORIZED --> CANCELLED: Cancel Payment
-    AUTHORIZED --> FAILED: Capture Failed
-    
-    CAPTURED --> PARTIALLY_REFUNDED: Partial Refund
-    CAPTURED --> REFUNDED: Full Refund
-    PARTIALLY_REFUNDED --> REFUNDED: Refund Remaining Amount
-    
-    FAILED --> [*]
-    CANCELLED --> [*]
-    REFUNDED --> [*]
-    CAPTURED --> [*]: Complete
-```
-
-### State Descriptions
-
-| State | Description | Available Actions |
-|-------|-------------|-------------------|
-| `PENDING` | Payment registered, awaiting authorization | Execute, Expire |
-| `AUTHORIZED` | Funds reserved on card | Capture, Cancel |
-| `CAPTURED` | Payment complete, funds charged | Refund |
-| `CANCELLED` | Authorization cancelled | None (terminal) |
-| `FAILED` | Payment failed | None (terminal) |
-| `PARTIALLY_REFUNDED` | Some funds returned | Refund (remaining) |
-| `REFUNDED` | Fully refunded | None (terminal) |
 
 ### Business Rules
 
@@ -823,10 +455,6 @@ class Payment < ApplicationRecord
     return 0 unless can_refund?
     amount - refunds.completed.sum(:amount)
   end
-
-  def total_refunded
-    refunds.completed.sum(:amount)
-  end
 end
 ```
 
@@ -834,7 +462,7 @@ end
 
 ## API Reference
 
-### Backend REST API Endpoints
+### Backend REST API
 
 | Method | Endpoint | Purpose | Auth Required |
 |--------|----------|---------|---------------|
@@ -855,154 +483,95 @@ end
 | PUT | `/v1/payments/:id/cancel` | Cancel authorization |
 | PUT | `/v1/payments/:id/refund` | Process refund |
 
----
+### Request/Response Examples
 
-## Database Schema
+#### Register Payment
 
-### Payments Table
-
-```ruby
-create_table :payments do |t|
-  t.references :user, foreign_key: true
-  t.references :order, foreign_key: true
-  t.string :fincode_order_id, null: false, index: { unique: true }
-  t.string :fincode_access_id, null: false
-  t.string :fincode_transaction_id
-  t.integer :amount, null: false
-  t.integer :tax, default: 0
-  t.string :status, default: 'pending', null: false
-  t.integer :capture_amount
-  t.string :customer_email
-  t.datetime :authorized_at
-  t.datetime :captured_at
-  t.datetime :canceled_at
-  t.text :error_message
-  t.timestamps
-end
-```
-
-### Refunds Table
-
-```ruby
-create_table :refunds do |t|
-  t.references :payment, null: false, foreign_key: true
-  t.references :processed_by, foreign_key: { to_table: :users }
-  t.integer :amount, null: false
-  t.text :reason
-  t.string :status, default: 'pending', null: false
-  t.string :fincode_refund_id, index: true
-  t.datetime :processed_at
-  t.timestamps
-end
-
-add_index :refunds, :status
-```
-
----
-
-## Security
-
-### PCI DSS Compliance
-
-- **Card data never touches backend**: All card details are tokenized on frontend
-- **Fincode SDK handles tokenization**: Secure, PCI-compliant process
-- **No card storage**: Backend only stores payment references
-
-### API Security
-
-```ruby
-# For development
-FINCODE_API_URL=https://api.test.fincode.jp
-FINCODE_SECRET_KEY=sk_test_...
-FINCODE_PUBLIC_KEY=pk_test_...
-
-# For production
-FINCODE_API_URL=https://api.fincode.jp
-FINCODE_SECRET_KEY=sk_live_...
-FINCODE_PUBLIC_KEY=pk_live_...
-```
-
-### Authentication
-
-All API endpoints require valid JWT token:
+**Request**:
 ```http
+POST /api/v1/payments/register
+Content-Type: application/json
+Authorization: Bearer {access_token}
+
+{
+  "amount": 5000
+}
+```
+
+**Response**:
+```json
+{
+  "success": true,
+  "order_id": "ORD_1737273600_a1b2c3d4e5f6",
+  "access_id": "a_9876543210fedcba",
+  "amount": 5000,
+  "public_key": "pk_test_..."
+}
+```
+
+#### Capture Payment
+
+**Request**:
+```http
+POST /api/v1/payments/:id/capture
 Authorization: Bearer {access_token}
 ```
 
-## Future Enhancements
-
-### Multi-Gateway Support
-
-To add Stripe support:
-
-```ruby
-# app/services/payments/gateways/stripe_gateway.rb
-module Payments
-  module Gateways
-    class StripeGateway < BaseGateway
-      def register(amount:, user:)
-        # Stripe implementation
-      end
-
-      def capture(order_id:, access_id:, amount:)
-        # Stripe implementation
-      end
-    end
-  end
-end
-
-# Usage
-service = Payments::PaymentService.new(
-  user,
-  gateway: Payments::Gateways::StripeGateway.new
-)
+**Response**:
+```json
+{
+  "success": true,
+  "payment_id": 123,
+  "status": "captured",
+  "captured_at": "2026-01-19T09:05:00Z",
+  "amount": 5000,
+  "message": "Payment captured successfully"
+}
 ```
 
-### Webhook Support
+#### Refund Payment
 
-```ruby
-# app/controllers/api/v1/fincode_webhooks_controller.rb
-class Api::V1::FincodeWebhooksController < ApplicationController
-  skip_before_action :authenticate_request
+**Request**:
+```http
+POST /api/v1/payments/:id/refund
+Content-Type: application/json
+Authorization: Bearer {access_token}
 
-  def create
-    event = verify_webhook_signature(request.body.read)
-    
-    case event['type']
-    when 'payment.authorized'
-      handle_payment_authorized(event['data'])
-    when 'payment.captured'
-      handle_payment_captured(event['data'])
-    end
+{
+  "amount": 2000,
+  "reason": "Customer requested refund"
+}
+```
 
-    head :ok
-  end
-end
+**Response**:
+```json
+{
+  "success": true,
+  "refund_id": 456,
+  "payment_id": 123,
+  "amount": 2000,
+  "status": "completed",
+  "remaining_amount": 3000,
+  "message": "Refund processed successfully"
+}
 ```
 
 ---
 
-**End of Documentation**
-
----
-
-## Fincode Reference
+## Testing
 
 ### Test Cards
 
-For testing payment flows in development/staging environments, use these test card numbers:
+#### Success Cases
 
-#### Credit Cards (Success Cases)
+| Card Brand | Card Number | Expiry | CVV | Result |
+|------------|-------------|--------|-----|--------|
+| VISA | `4111111111111111` | `2512` | `123` | Success |
+| MasterCard | `5555555555554444` | `2512` | `123` | Success |
+| JCB | `3566111111111113` | `2512` | `123` | Success |
+| Amex | `378282246310005` | `2512` | `1234` | Success |
 
-| Card Brand | Card Number | Expiry | CVV | Expected Result |
-|------------|-------------|--------|-----|-----------------|
-| VISA | `4111111111111111` | Any future date (YYMM) | `123` | Success |
-| MasterCard | `5555555555554444` | Any future date (YYMM) | `123` | Success |
-| JCB | `3566111111111113` | Any future date (YYMM) | `123` | Success |
-| American Express | `378282246310005` | Any future date (YYMM) | `1234` | Success |
-| Diners Club | `36227206271667` | Any future date (YYMM) | `123` | Success |
-
-#### Error Test Cases
+#### Error Cases
 
 | Card Number | Expected Error |
 |-------------|----------------|
@@ -1011,79 +580,73 @@ For testing payment flows in development/staging environments, use these test ca
 | `4000000000000127` | Incorrect CVV |
 | `4000000000000119` | Processing error |
 
-**Note**: 
-- Expiry format: `YYMM` (e.g., `2512` for December 2025)
-- Holder name: Any valid name (e.g., `TARO YAMADA`)
-- CVV: 3 digits for most cards, 4 digits for Amex
-
-**Reference**: [Fincode Test Resources](https://docs.fincode.jp/develop_support/test_resources)
+**Format Notes**:
+- Expiry: `YYMM` (e.g., `2512` = December 2025)
+- Holder: Any valid name (e.g., `TARO YAMADA`)
+- CVV: 3 digits (4 for Amex)
 
 ---
 
-### Refund Policies by Payment Method
+### Environment Configuration
 
-Different payment methods have different refund policies and timelines:
+```bash
+# Production
+FINCODE_API_URL=https://api.fincode.jp
+FINCODE_SECRET_KEY=sk_live_...
+FINCODE_PUBLIC_KEY=pk_live_...
+
+# Monitoring
+SENTRY_DSN=https://...
+ERROR_NOTIFICATION_EMAIL=ops@example.com
+
+# Rate Limiting
+PAYMENT_RATE_LIMIT=10  # requests per minute per user
+```
+
+---
+
+## Fincode Reference
+
+### Refund Policies
 
 #### Credit Card Refunds
 
-| Payment Method | Refund Type | Processing Time | Notes |
-|----------------|-------------|-----------------|-------|
-| Credit Card | Full Refund | 3-5 business days | Funds returned to original card |
-| Credit Card | Partial Refund | 3-5 business days | Multiple partial refunds allowed |
-| Credit Card | Same-day Refund | Immediate (if before settlement) | Only before daily settlement cutoff |
+| Refund Type | Processing Time | Notes |
+|-------------|-----------------|-------|
+| Full Refund | 3-5 business days | Funds returned to original card |
+| Partial Refund | 3-5 business days | Multiple partial refunds allowed |
+| Same-day Refund | Immediate | Only before daily settlement cutoff |
 
 **Important Notes**:
-- **Settlement Timing**: Credit card payments are typically settled once per day (usually around midnight JST)
-- **Before Settlement**: Refunds processed before settlement are instant
-- **After Settlement**: Refunds take 3-5 business days to appear on customer's statement
-- **Partial Refunds**: You can issue multiple partial refunds up to the original payment amount
-- **Refund Limit**: Total refunds cannot exceed the original payment amount
+- Settlement occurs daily around midnight JST
+- Refunds before settlement are instant
+- Refunds after settlement take 3-5 business days
+- Multiple partial refunds allowed up to original amount
 
 #### Refund Restrictions
 
-- Cannot refund a payment that is still in `AUTHORIZED` state (use Cancel instead)
-- Cannot refund more than the original payment amount
-- Cannot refund a payment that has already been fully refunded
+- Cannot refund `AUTHORIZED` payments (use Cancel instead)
+- Cannot refund more than original amount
+- Cannot refund already fully refunded payments
 - Can issue multiple partial refunds
-- Can refund any amount from ¥1 up to remaining amount
+- Can refund from ¥1 up to remaining amount
 
-**Reference**: [Fincode Payment Notes](https://docs.fincode.jp/payment/note)
-
----
-
-### Error Codes Reference
-
-Common Fincode API error codes and their meanings:
+### Error Codes
 
 #### HTTP Status Codes
 
-| Status Code | Meaning | Common Causes |
-|-------------|---------|---------------|
+| Code | Meaning | Common Causes |
+|------|---------|---------------|
 | `200` | Success | Request processed successfully |
-| `201` | Created | Resource created successfully |
-| `400` | Bad Request | Invalid request parameters |
-| `401` | Unauthorized | Invalid or missing API key |
-| `403` | Forbidden | API key lacks required permissions |
-| `404` | Not Found | Payment/resource not found |
-| `422` | Unprocessable Entity | Business logic validation failed |
-| `500` | Internal Server Error | Fincode server error |
-| `503` | Service Unavailable | Fincode maintenance or downtime |
+| `400` | Bad Request | Invalid parameters |
+| `401` | Unauthorized | Invalid/missing API key |
+| `403` | Forbidden | Insufficient permissions or funds |
+| `404` | Not Found | Payment not found |
+| `422` | Unprocessable | Business logic validation failed |
+| `500` | Server Error | Fincode server error |
 
-#### Common Error Responses
+#### Error Response Example
 
-**400 Bad Request**:
-```json
-{
-  "errors": [
-    {
-      "error_code": "E01010001",
-      "error_message": "Invalid parameter: amount must be greater than 0"
-    }
-  ]
-}
-```
-
-**403 Forbidden**:
 ```json
 {
   "errors": [
@@ -1095,103 +658,14 @@ Common Fincode API error codes and their meanings:
 }
 ```
 
-**404 Not Found**:
-```json
-{
-  "errors": [
-    {
-      "error_code": "E01030001",
-      "error_message": "Payment not found"
-    }
-  ]
-}
-```
-
-#### Error Handling Best Practices
-
-1. **Always check HTTP status code first**
-2. **Parse error response for detailed error messages**
-3. **Log error codes for debugging**
-4. **Show user-friendly messages to customers**
-5. **Implement retry logic for 5xx errors**
-
-**Example Error Handler**:
-```ruby
-def handle_fincode_error(response)
-  case response.code
-  when 400
-    errors = parse_errors(response)
-    Rails.logger.error("Fincode 400: #{errors}")
-    raise Payments::ValidationError, "Invalid request: #{errors}"
-  when 401
-    Rails.logger.error("Fincode 401: Unauthorized")
-    raise Payments::Error, "Authentication failed"
-  when 403
-    errors = parse_errors(response)
-    Rails.logger.error("Fincode 403: #{errors}")
-    raise Payments::Error, "Payment declined: #{errors}"
-  when 404
-    raise Payments::NotFoundError, "Payment not found"
-  when 500..599
-    Rails.logger.error("Fincode 5xx: Server error")
-    raise Payments::Error, "Payment service temporarily unavailable"
-  end
-end
-```
-
-**Reference**: [Fincode Error Codes](https://docs.fincode.jp/develop_support/error)
-
----
-
-### API Documentation
-
-Complete Fincode API documentation and resources:
-
-#### Core API Documentation
+### API Documentation Links
 
 - **API Reference**: [https://docs.fincode.jp/api](https://docs.fincode.jp/api)
 - **Payment API**: [https://docs.fincode.jp/api#tag/payment](https://docs.fincode.jp/api#tag/payment)
-- **Card API**: [https://docs.fincode.jp/api#tag/card](https://docs.fincode.jp/api#tag/card)
-- **Customer API**: [https://docs.fincode.jp/api#tag/customer](https://docs.fincode.jp/api#tag/customer)
+- **Test Resources**: [https://docs.fincode.jp/develop_support/test_resources](https://docs.fincode.jp/develop_support/test_resources)
+- **Error Codes**: [https://docs.fincode.jp/develop_support/error](https://docs.fincode.jp/develop_support/error)
+- **Payment Notes**: [https://docs.fincode.jp/payment/note](https://docs.fincode.jp/payment/note)
 
-#### Integration Guides
-
-- **Getting Started**: [https://docs.fincode.jp/getting_started](https://docs.fincode.jp/getting_started)
-- **Authentication**: [https://docs.fincode.jp/authentication](https://docs.fincode.jp/authentication)
-- **Webhooks**: [https://docs.fincode.jp/webhooks](https://docs.fincode.jp/webhooks)
-- **Security**: [https://docs.fincode.jp/security](https://docs.fincode.jp/security)
-
-#### SDK & Libraries
-
-- **JavaScript SDK**: For frontend tokenization and payment execution
-- **REST API**: For backend payment operations
-- **Webhook Events**: For real-time payment status updates
-
-#### Support Resources
-
-- **Test Environment**: Use test API keys for development
-- **Sandbox**: Full-featured test environment
-- **Support**: Contact Fincode support for production issues
-- **Status Page**: Check Fincode service status
-
----
-
-## Additional Resources
-
-### Environment Variables
-
-Required environment variables for Fincode integration:
-
-```bash
-# Fincode API Configuration
-FINCODE_API_URL=https://api.fincode.jp
-FINCODE_SECRET_KEY=sk_test_...  # Backend API key
-FINCODE_PUBLIC_KEY=pk_test_...  # Frontend SDK key
-
-# Use production keys in production
-# FINCODE_SECRET_KEY=sk_live_...
-# FINCODE_PUBLIC_KEY=pk_live_...
-```
 ---
 
 **End of Documentation**
